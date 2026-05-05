@@ -85,8 +85,8 @@
   'use strict';
 
   var version = {
-    "version": "2.24.2",
-    "date": "2025-12-23T20:20:20Z"
+    "version": "2.24.3",
+    "date": "2026-05-05T05:21:22Z"
   };
 
   var meta = {
@@ -19689,7 +19689,7 @@ aero|asia|biz|cat|com|coop|dance|info|int|jobs|mobi|moe|museum|name|net|org|post
         isArchived: '.archivedIcon'
       },
       file: {
-        text: '.file > :first-child',
+        text: '.file > .fileText',
         link: '.fileText > a',
         thumb: 'a.fileThumb > [data-md5]'
       },

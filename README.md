@@ -1,9 +1,9 @@
-# 4chan XT is dead
+# 4chan XT is NOT dead!
 
-I stopped using 4chan since the hack. I now browse alt chans that actually care about their users, and don't need an 
-userscript fighting their shitty design.
+Many people still use it. I plan on updating and fixing any errors that might come up due to 4chan's site changes.
 
-<details>
+May 5, 2026 - Fixed webm/mp4 file names not being visible in Yotsuba theme.
+
 <summary>Old readme</summary>
 
 4chan XT is a script that adds various features to anonymous imageboards. It was originally developed for 4chan but has
@@ -63,8 +63,8 @@ To run an user script, you need an user script manager like Violentmonkey
 [Edge](https://microsoftedge.microsoft.com/addons/detail/iikmkjmpaadaobahmlepeloendndfphd),
 [Safari](https://apps.apple.com/app/tampermonkey/id6738342400)).
 
-This fork is distributed through [GitHub releases](https://github.com/TuxedoTako/4chan-xt/releases) and [Greasy Fork](https://greasyfork.org/scripts/489508-4chan-xt).
-There are known issues with updating user scripts through GitHub: [#34](https://github.com/TuxedoTako/4chan-xt/issues/34)
+This fork is distributed through [GitHub releases](https://github.com/nick-s-b/4chan-xt/releases) and [Greasy Fork (old, not mine, not updated)](https://greasyfork.org/scripts/489508-4chan-xt).
+There are known issues with updating user scripts through GitHub: [#34](https://github.com/nick-s-b/4chan-xt/issues/34)
 [violentmonkey#1673](https://github.com/violentmonkey/violentmonkey/issues/1673), but Greasy Fork doesn't allow the
 minified version. Automatic updates are supported for the user script version, but not the Chrome extension.
 
@@ -80,18 +80,18 @@ The simplest build is as easy as `npm install` `npm run build`, but there are so
 - `-test` Include tests in build.
 
 ## Troubleshooting
-If you encounter a bug, try the steps [here](https://github.com/TuxedoTako/4chan-xt/blob/project-XT/CONTRIBUTING.md#reporting-bugs),
-then report it to the [issue tracker](https://github.com/TuxedoTako/4chan-xt/issues?q=is%3Aopen+sort%3Aupdated-desc).
+If you encounter a bug, try the steps [here](https://github.com/nick-s-b/4chan-xt/blob/project-XT/CONTRIBUTING.md#reporting-bugs),
+then report it to the [issue tracker](https://github.com/nick-s-b/4chan-xt/issues?q=is%3Aopen+sort%3Aupdated-desc).
 If the bug seems to be caused by a script update, you can install a old version from the
-[GitHub releases](https://github.com/TuxedoTako/4chan-xt/releases) or from
+[GitHub releases](https://github.com/nick-s-b/4chan-xt/releases) or from
 [Greasy Fork](https://greasyfork.org/scripts/489508-4chan-xt/versions).
 
 ## More information
-- [Changelog](https://github.com/TuxedoTako/4chan-xt/blob/project-XT/CHANGELOG.md)
-- [Frequently Asked Questions for this fork](https://github.com/TuxedoTako/4chan-xt/wiki/Frequently-Asked-Questions)
+- [Changelog](https://github.com/nick-s-b/4chan-xt/blob/project-XT/CHANGELOG.md)
+- [Frequently Asked Questions for this fork](https://github.com/nick-s-b/4chan-xt/wiki/Frequently-Asked-Questions)
 - [Frequently Asked Questions for upstream, most should still apply](https://github.com/ccd0/4chan-x/wiki/Frequently-Asked-Questions)
-- [Report Bugs](https://github.com/TuxedoTako/4chan-xt/issues?q=is%3Aopen+sort%3Aupdated-desc)
-- [Contributing](https://github.com/TuxedoTako/4chan-xt/blob/project-XT/CONTRIBUTING.md)
+- [Report Bugs](https://github.com/nick-s-b/4chan-xt/issues?q=is%3Aopen+sort%3Aupdated-desc)
+- [Contributing](https://github.com/nick-s-b/4chan-xt/blob/project-XT/CONTRIBUTING.md)
 
 ### TODO
 
