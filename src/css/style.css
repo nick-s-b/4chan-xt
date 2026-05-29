@@ -1745,7 +1745,7 @@ input#qr-filename {
 }
 #qr:not(.has-spoiler) #qr-spoiler-label,
 #file-n-submit:not(.has-file) :is(#qr-spoiler-label, #qr-randomize, #qr-restore-name),
-#file-n-submit:not(.has-image) #qr-jpg,
+#file-n-submit:not(.has-image) :is(#qr-jpg, #qr-roll-md5),
 #file-n-submit:not(.has-image):not(.has-video) #qr-view,
 #file-n-submit.has-file :is(#paste-area, #url-button),
 #file-n-submit:not(.custom-cooldown) #custom-cooldown-button {

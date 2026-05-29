@@ -88,6 +88,7 @@ var QR = {
     flag?: HTMLSelectElement,
     preview?: HTMLDivElement;
     splitPost?: HTMLAnchorElement;
+    rollMd5: HTMLAnchorElement;
   },
   shortcut: undefined as HTMLAnchorElement,
   hasFocus: false,
@@ -783,6 +784,7 @@ var QR = {
     setNode('drawButton',     '#qr-draw-button');
     setNode('randomizeButton','#qr-randomize');
     setNode('compress',       '#qr-jpg');
+    setNode('rollMd5',        '#qr-roll-md5')
     setNode('view',           '#qr-view');
     setNode('restoreNameButton','#qr-restore-name');
     setNode('fileSubmit',     '#file-n-submit');
@@ -833,6 +835,7 @@ var QR = {
     $.on(nodes.noFile,         'click',     QR.openFileInput);
     $.on(nodes.randomizeButton,'click',     () => { QR.selected.randomizeName(); });
     $.on(nodes.compress,       'click',     async () => { QR.handleFiles([await QR.convert(QR.selected.file)]); });
+    $.on(nodes.rollMd5,        'click',     async () => { QR.handleFiles([await QR.rollMd5(QR.selected.file)]); })
     $.on(nodes.view,           'click',     QR.preview);
     $.on(nodes.restoreNameButton,'click',   () => { QR.selected.restoreName(); });
     $.on(nodes.filename,       'focus',     function() { return $.addClass(this.parentNode, 'focus'); });
@@ -898,6 +901,7 @@ var QR = {
     Icon.set(nodes.customCooldown, 'clock');
     Icon.set(nodes.randomizeButton, 'shuffle');
     Icon.set(nodes.compress, 'shrink');
+    Icon.set(nodes.rollMd5, 'dice');
     Icon.set(nodes.view, 'eye');
     Icon.set(nodes.restoreNameButton, 'undo');
     Icon.set(nodes.splitPost, 'scissors');
@@ -1320,6 +1324,47 @@ var QR = {
     return newFile;
   },
 
+  /**
+   * Alters the pixel data of an image file slightly to change its MD5 hash.
+   * Only supports image files; returns the original file for unsupported types.
+   * @param file The image file to modify.
+   * @returns A Promise that resolves to a new File with a modified MD5 hash, or the original file if not supported.
+   */
+  async rollMd5(file: File): Promise<File> {
+
+    if (!file.type.startsWith("image/") || file.type === "image/gif") {
+      new Notice('warning', "MD5 change supports only static image files.")
+      return file;
+    }
+
+    return new Promise((resolve, reject) => {
+      const img= new Image();
+
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = img.width;
+        canvas.height = img.height;
+
+        const ctx = canvas.getContext('2d');
+        if(!ctx) {
+          throw new Error(`Image MD5 canvas failed`);
+        }
+        ctx.drawImage(img, 0,0);
+        //flip one bit
+        const pixel = ctx.getImageData(0,0,1,1);
+        pixel.data[0] ^= 1;
+        ctx.putImageData(pixel, 0,0);
+        //re-encode
+        canvas.toBlob(blob => {
+          resolve(new File([blob!], file.name, { type: file.type}));
+        }, file.type, 0.98);
+      };
+
+    img.onerror = reject;
+    img.src = URL.createObjectURL(file);
+    });
+  },
+   
   previewUrl: undefined as string | undefined,
 
   preview() {
