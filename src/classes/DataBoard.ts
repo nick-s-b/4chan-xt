@@ -38,6 +38,7 @@ export default class DataBoard {
     'hiddenPosterIds',
     'lastReadPosts',
     'yourPosts',
+    'yourPostsForever',
     'watchedThreads',
     'watcherLastModified',
     'customTitles',

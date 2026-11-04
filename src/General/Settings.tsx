@@ -349,6 +349,7 @@ Enable it on boards.${location.hostname.split('.')[1]}.org in your browser's pri
       delete Conf2.hiddenPosterIds;
       delete Conf2.lastReadPosts;
       delete Conf2.yourPosts;
+      delete Conf2.yourPostsForever;
       delete Conf2.watchedThreads;
       delete Conf2.cooldowns;
       delete Conf2['Index Sort'];

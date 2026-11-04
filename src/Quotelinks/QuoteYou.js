@@ -9,6 +9,7 @@ import ExpandComment from "../Miscellaneous/ExpandComment";
 import ScrollMarkers from "../Miscellaneous/ScrollMarkers";
 import $ from "../platform/$";
 import $$ from "../platform/$$";
+import { dict } from "../platform/helpers";
 import PostRedirect from "../Posting/PostRedirect";
 
 /*
@@ -21,12 +22,18 @@ var QuoteYou = {
     if (!Conf['Remember Your Posts']) { return; }
 
     this.db = new DataBoard('yourPosts');
+    // Permanent copy of your posts, never cleaned. Value = time the post was recorded (ms).
+    this.dbForever = new DataBoard('yourPostsForever', QuoteYou.buildIndex, true);
+    QuoteYou.buildIndex();
+    QuoteYou.backfillForever();
     $.sync('Remember Your Posts', enabled => Conf['Remember Your Posts'] = enabled);
     $.on(d, 'QRPostSuccessful', function(e) {
       const cb = PostRedirect.delay();
+      const cbForever = PostRedirect.delay();
       return $.get('Remember Your Posts', Conf['Remember Your Posts'], function(items) {
         if (!items['Remember Your Posts']) { return; }
         const {boardID, threadID, postID} = e.detail;
+        QuoteYou.rememberForever({boardID, threadID, postID}, cbForever);
         return QuoteYou.db.set({boardID, threadID, postID, val: true}, cb);
       });
     });
@@ -64,6 +71,77 @@ var QuoteYou = {
       boardID:  post.boardID,
       threadID: post.threadID,
       postID:   post.ID
+    });
+  },
+
+  // Index of `yourPostsForever` as "siteID/boardID/postID". Post numbers are unique per board,
+  // so the thread number is not needed to recognize a post as yours.
+  foreverIndex: new Set(),
+
+  buildIndex() {
+    const index = new Set();
+    const data = QuoteYou.dbForever?.data || {};
+    for (const siteID in data) {
+      const boards = data[siteID]?.boards;
+      if (!boards || typeof boards !== 'object') continue;
+      for (const boardID in boards) {
+        for (const threadID in boards[boardID]) {
+          for (const postID in boards[boardID][threadID]) {
+            index.add(`${siteID}/${boardID}/${postID}`);
+          }
+        }
+      }
+    }
+    QuoteYou.foreverIndex = index;
+  },
+
+  isYouPostID(siteID, boardID, postID) {
+    return QuoteYou.foreverIndex.has(`${siteID || g.SITE.ID}/${boardID}/${postID}`);
+  },
+
+  rememberForever({boardID, threadID, postID}, cb) {
+    if (!QuoteYou.dbForever) return cb?.();
+    QuoteYou.foreverIndex.add(`${g.SITE.ID}/${boardID}/${postID}`);
+    QuoteYou.dbForever.set({boardID, threadID, postID, val: Date.now()}, cb);
+  },
+
+  forgetForever({boardID, threadID, postID}) {
+    if (!QuoteYou.dbForever) return;
+    QuoteYou.foreverIndex.delete(`${g.SITE.ID}/${boardID}/${postID}`);
+    QuoteYou.dbForever.delete({boardID, threadID, postID});
+  },
+
+  // One time: copy everything already in `yourPosts` into `yourPostsForever`, dated now.
+  backfillForever() {
+    $.get('yourPostsForeverBackfilled', false, function({yourPostsForeverBackfilled}) {
+      if (yourPostsForeverBackfilled) return;
+      const now = Date.now();
+      QuoteYou.dbForever.save(() => {
+        const from = QuoteYou.db.data;
+        const to = QuoteYou.dbForever.data;
+        for (const siteID in from) {
+          const boards = from[siteID]?.boards;
+          if (!boards || typeof boards !== 'object') continue;
+          to[siteID] ||= {boards: dict()};
+          const toBoards = to[siteID].boards;
+          for (const boardID in boards) {
+            for (const threadID in boards[boardID]) {
+              const posts = boards[boardID][threadID];
+              if (!posts || typeof posts !== 'object') continue;
+              for (const postID in posts) {
+                if (!posts[postID]) continue;
+                toBoards[boardID] ||= dict();
+                toBoards[boardID][threadID] ||= dict();
+                toBoards[boardID][threadID][postID] ??= now;
+              }
+            }
+          }
+        }
+      }, () => {
+        QuoteYou.buildIndex();
+        $.set('yourPostsForeverBackfilled', true);
+      });
+      QuoteYou.buildIndex();
     });
   },
 
@@ -111,8 +189,10 @@ var QuoteYou = {
       const data = {boardID: post.board.ID, threadID: post.thread.ID, postID: post.ID, val: true};
       if (this.checked) {
         QuoteYou.db.set(data);
+        QuoteYou.rememberForever(data);
       } else {
         QuoteYou.db.delete(data);
+        QuoteYou.forgetForever(data);
       }
       for (var clone of [post].concat(post.clones)) {
         clone.nodes.root.classList.toggle('yourPost', this.checked);

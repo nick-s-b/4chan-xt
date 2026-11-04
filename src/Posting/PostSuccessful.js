@@ -21,6 +21,13 @@ const PostSuccessful = {
     threadID = +threadID || postID;
 
     const db = new DataBoard('yourPosts');
+    const dbForever = new DataBoard('yourPostsForever', undefined, true);
+    dbForever.set({
+      boardID: g.BOARD.ID,
+      threadID,
+      postID,
+      val: Date.now()
+    });
     return db.set({
       boardID: g.BOARD.ID,
       threadID,
