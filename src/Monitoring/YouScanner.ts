@@ -4,8 +4,10 @@ import { dict, MINUTE } from "../platform/helpers";
 import QuoteYou from "../Quotelinks/QuoteYou";
 import ThreadWatcher from "./ThreadWatcher";
 import {
+	ADD_SLOTS,
 	AWAY_GAP,
 	addedKeysToDrop,
+	CYCLE_CAP,
 	CYCLE_INTERVAL,
 	cycleDue,
 	findQuotedPosts,
@@ -13,12 +15,16 @@ import {
 	MAX_ADDED_ENTRIES,
 	MAX_ARCHIVE_FETCHES,
 	MAX_THREAD_FETCHES,
+	needsArchiveScan,
 	needsThreadFetch,
 	pickBoards,
 	REQUEST_GAP,
 	START_JITTER,
+	STORAGE_PAUSE,
+	STORAGE_TIMEOUT,
 	staleBoards,
 	type ThreadScanState,
+	threadState,
 } from "./YouScannerLogic";
 
 /*
@@ -29,7 +35,7 @@ import {
 
 /** Stored per board under `youScannerState`. */
 interface BoardScanState {
-	/** Time of this board's last cycle (ms). */
+	/** Time of this board's last cycle (ms). Used to drop boards not scanned for a week. */
 	lastCycle: number;
 	/** Highest thread number seen in this board's catalog. */
 	maxThreadNoSeen: number;
@@ -51,10 +57,29 @@ interface ApiCatalogThread extends ApiPost {
 	last_replies?: ApiPost[];
 }
 
+/** One running cycle. Work left over from a stopped cycle sees a newer `gen` and stops at its next step. */
+interface Cycle {
+	gen: number;
+	/** No tab scanned for longer than AWAY_GAP before this cycle started (browser closed or asleep). */
+	away: boolean;
+}
+
+/** A queued job: one request, or adding a thread to the watcher. */
+interface Job {
+	cycle: Cycle;
+	/** Slots of REQUEST_GAP this job takes before the next job may start. */
+	slots: number;
+	run: () => void;
+	cancel: () => void;
+}
+
 const ENABLED = "Find replies to you in other threads";
 /** Web Locks name. All 4chan board tabs share the boards.4chan.org origin, so one lock covers every tab. */
 const LOCK_NAME = "4chanXT-youScanner";
 const BOARDS = "Reply scan boards";
+const STORAGE_FAILED = "Reply scanner: storage did not answer";
+const CYCLE_TOO_LONG = "Reply scanner: cycle stopped at the time cap";
+const CYCLE_STOPPED = "Reply scanner: cycle stopped";
 
 /** Highest post number in `posts`, or `from` if that is higher. */
 const highestNo = (posts: ApiPost[], from: number) => {
@@ -68,11 +93,16 @@ const highestNo = (posts: ApiPost[], from: number) => {
 const YouScanner = {
 	running: false,
 	timeout: undefined as ReturnType<typeof setTimeout> | undefined,
-	queue: [] as (() => void)[],
+	queue: [] as Job[],
 	pumping: false,
-	lastRequestStart: 0,
+	/** Earliest time the next queued job may start. */
+	nextStartAt: 0,
 	/** Last time this tab wrote `youScannerLastRun`. */
 	lastHeartbeat: 0,
+	/** Generation of the running cycle; raised when a cycle ends or is stopped. */
+	cycleGen: 0,
+	/** After a storage failure this tab does not scan before this time. */
+	pausedUntil: 0,
 	/** Boards whose last pass in this tab left threads unscanned (fetch cap reached or a fetch failed). */
 	pending: new Set<string>(),
 
@@ -112,14 +142,18 @@ const YouScanner = {
 	 * refreshes that value while it works (see heartbeat), so other tabs wait while it is mid-cycle.
 	 */
 	tick() {
-		if (!YouScanner.isEnabled() || YouScanner.running) {
-			YouScanner.schedule(CYCLE_INTERVAL);
+		// Schedule the next check first, so a storage callback that never comes cannot stop the loop.
+		YouScanner.schedule(CYCLE_INTERVAL);
+		if (
+			!YouScanner.isEnabled() ||
+			YouScanner.running ||
+			Date.now() < YouScanner.pausedUntil
+		)
 			return;
-		}
 		$.get("youScannerLastRun", 0, ({ youScannerLastRun }) => {
+			if (YouScanner.running) return;
 			const now = Date.now();
 			if (cycleDue(youScannerLastRun, now)) {
-				YouScanner.schedule(CYCLE_INTERVAL);
 				YouScanner.startCycle();
 			} else {
 				YouScanner.schedule(CYCLE_INTERVAL - (now - youScannerLastRun));
@@ -164,7 +198,10 @@ const YouScanner = {
 		setTimeout(YouScanner.runIfDue, Math.random() * START_JITTER);
 	},
 
-	/** Reads `youScannerLastRun` again (inside the lock, or after the random delay) and runs the cycle if still due. */
+	/**
+	 * Reads `youScannerLastRun` again (inside the lock, or after the random delay) and runs the cycle if still due.
+	 * Always returns, so the lock is always released.
+	 */
 	async runIfDue() {
 		try {
 			const lastRun: number = await YouScanner.getStored(
@@ -176,8 +213,12 @@ const YouScanner = {
 				YouScanner.schedule(CYCLE_INTERVAL - (now - lastRun));
 				return;
 			}
+			// No tab scanned for longer than AWAY_GAP: the browser was closed or asleep.
+			const away = !!lastRun && now - lastRun > AWAY_GAP;
 			YouScanner.heartbeat(true);
-			await YouScanner.runCycle();
+			await YouScanner.runCycle(away);
+		} catch (err) {
+			YouScanner.onError(err);
 		} finally {
 			YouScanner.running = false;
 		}
@@ -191,36 +232,78 @@ const YouScanner = {
 		$.set("youScannerLastRun", now);
 	},
 
-	async runCycle() {
+	/** Runs one cycle, stopped after CYCLE_CAP at the latest. */
+	async runCycle(away: boolean) {
 		YouScanner.running = true;
+		const cycle: Cycle = { gen: ++YouScanner.cycleGen, away };
+		let capTimer: ReturnType<typeof setTimeout> | undefined;
+		const work = YouScanner.cycleWork(cycle);
+		// Errors of work that goes on after a stop are not reported again.
+		work.catch((err) => err);
 		try {
-			const forever = QuoteYou.dbForever.data[g.SITE.ID]?.boards;
-			const boards = pickBoards(forever, Conf[BOARDS], Date.now());
-			for (const boardID of boards) {
-				if (!YouScanner.isEnabled()) break;
-				await YouScanner.scanBoard(boardID);
-			}
-			await YouScanner.prune(Date.now());
+			await Promise.race([
+				work,
+				new Promise((_resolve, reject) => {
+					capTimer = setTimeout(
+						() => reject(new Error(CYCLE_TOO_LONG)),
+						CYCLE_CAP,
+					);
+				}),
+			]);
 		} catch (err) {
-			c.error(err);
+			YouScanner.onError(err);
 		} finally {
+			clearTimeout(capTimer);
+			YouScanner.stopCycle();
 			YouScanner.running = false;
 		}
 	},
 
-	async scanBoard(boardID: string) {
+	async cycleWork(cycle: Cycle) {
+		const forever = QuoteYou.dbForever.data[g.SITE.ID]?.boards;
+		const boards = pickBoards(forever, Conf[BOARDS], Date.now());
+		for (const boardID of boards) {
+			if (!YouScanner.isEnabled()) break;
+			await YouScanner.scanBoard(boardID, cycle);
+			YouScanner.alive(cycle);
+		}
+		await YouScanner.prune(Date.now(), cycle);
+	},
+
+	/** Ends the current cycle: its queued jobs are dropped and its remaining work stops at its next step. */
+	stopCycle() {
+		YouScanner.cycleGen++;
+		for (const job of YouScanner.queue.splice(0)) job.cancel();
+	},
+
+	alive(cycle: Cycle) {
+		if (cycle.gen !== YouScanner.cycleGen) throw new Error(CYCLE_STOPPED);
+	},
+
+	onError(err: unknown) {
+		const message = err instanceof Error ? err.message : "";
+		if (message === CYCLE_STOPPED) return;
+		// Storage does not answer (for example after an extension update): let other tabs take over for a while.
+		if (message === STORAGE_FAILED)
+			YouScanner.pausedUntil = Date.now() + STORAGE_PAUSE;
+		c.error(err);
+	},
+
+	async scanBoard(boardID: string, cycle: Cycle) {
 		const siteID = g.SITE.ID;
 		const catalogURL = g.SITE.urls.catalogJSON({ siteID, boardID });
 		// Work left over from the previous pass: ask for the full catalog instead of a possible 304.
 		if (YouScanner.pending.has(boardID))
 			delete $.lastModified.YouScanner?.[catalogURL];
-		const catalogReq = await YouScanner.request(catalogURL, true);
+		const catalogReq = await YouScanner.request(catalogURL, true, cycle);
+		YouScanner.alive(cycle);
 		const now = Date.now();
 		if (catalogReq?.status === 304) {
 			await YouScanner.saveBoard(
 				boardID,
 				(state) => state && { ...state, lastCycle: now },
 			);
+			YouScanner.alive(cycle);
 			return;
 		}
 		const pages = catalogReq?.status === 200 ? catalogReq.response : null;
@@ -230,6 +313,7 @@ const YouScanner = {
 		const prev: BoardScanState | undefined = (await YouScanner.loadState())[
 			boardID
 		];
+		YouScanner.alive(cycle);
 		const oldThreads = prev?.threads || {};
 		const threads: Record<string, ThreadScanState> = dict();
 		const inCatalog = new Set<string>();
@@ -237,79 +321,108 @@ const YouScanner = {
 		let fetches = 0;
 		let leftover = false;
 
-		for (const page of pages) {
-			for (const thread of (page?.threads || []) as ApiCatalogThread[]) {
-				const key = `${thread.no}`;
-				inCatalog.add(key);
-				if (thread.no > maxThreadNoSeen) maxThreadNoSeen = thread.no;
-				const old: ThreadScanState | undefined = oldThreads[key];
-				const from = old?.lastScannedNo || 0;
-				const replies = thread.replies || 0;
-				const catalogPosts = [thread, ...(thread.last_replies || [])];
+		// Last page first: the threads closest to being archived get the thread fetches first.
+		const catalogThreads: ApiCatalogThread[] = [];
+		for (const page of pages) catalogThreads.push(...(page?.threads || []));
+		catalogThreads.reverse();
 
-				// The watcher checks watched threads itself; only keep the state current.
-				if (ThreadWatcher.isWatchedRaw(boardID, thread.no)) {
-					threads[key] = {
-						replies,
-						lastScannedNo: highestNo(catalogPosts, from),
-					};
-					continue;
-				}
+		for (const thread of catalogThreads) {
+			const key = `${thread.no}`;
+			inCatalog.add(key);
+			if (thread.no > maxThreadNoSeen) maxThreadNoSeen = thread.no;
+			const old: ThreadScanState | undefined = oldThreads[key];
+			const from = old?.lastScannedNo || 0;
+			const replies = thread.replies || 0;
+			const catalogPosts = [thread, ...(thread.last_replies || [])];
+			// Not scanned this cycle (over the cap, failed fetch or failed add): keep the old state, or store a new
+			// thread as pending, so it is done next cycle or looked up in the archive if it leaves the catalog first.
+			const notScanned = () => {
+				threads[key] = old
+					? threadState(old.replies, old.lastScannedNo, replies, !!old.pending)
+					: threadState(0, 0, replies, true);
+				leftover = true;
+			};
 
-				// The catalog holds every new reply: scan the OP and last replies, no extra request.
-				if (!needsThreadFetch(old, thread)) {
-					await YouScanner.scanPosts(
-						boardID,
-						thread.no,
-						catalogPosts,
-						from,
-						thread,
-						false,
-					);
-					threads[key] = {
-						replies,
-						lastScannedNo: highestNo(catalogPosts, from),
-					};
-					continue;
-				}
+			// The watcher checks watched threads itself; only keep the state current.
+			if (ThreadWatcher.isWatchedRaw(boardID, thread.no)) {
+				threads[key] = threadState(
+					replies,
+					highestNo(catalogPosts, from),
+					replies,
+				);
+				continue;
+			}
 
-				// Over the cap or failed: keep the old state, done next cycle.
-				if (fetches >= MAX_THREAD_FETCHES) {
-					if (old) threads[key] = old;
-					leftover = true;
-					continue;
-				}
-				fetches++;
-				const posts = await YouScanner.fetchThreadPosts(boardID, thread.no);
-				if (!posts) {
-					if (old) threads[key] = old;
-					leftover = true;
-					continue;
-				}
-				await YouScanner.scanPosts(
+			// The catalog holds every new reply: scan the OP and last replies, no extra request.
+			if (!needsThreadFetch(old, thread)) {
+				const ok = await YouScanner.scanPosts(
 					boardID,
 					thread.no,
-					posts,
+					catalogPosts,
 					from,
-					posts[0],
-					!!posts[0].archived,
+					thread,
+					false,
+					cycle,
 				);
-				threads[key] = { replies, lastScannedNo: highestNo(posts, from) };
+				if (ok) {
+					threads[key] = threadState(
+						replies,
+						highestNo(catalogPosts, from),
+						replies,
+					);
+				} else {
+					notScanned();
+				}
+				continue;
+			}
+
+			if (fetches >= MAX_THREAD_FETCHES) {
+				notScanned();
+				continue;
+			}
+			fetches++;
+			const posts = await YouScanner.fetchThreadPosts(
+				boardID,
+				thread.no,
+				cycle,
+			);
+			if (!posts) {
+				notScanned();
+				continue;
+			}
+			const ok = await YouScanner.scanPosts(
+				boardID,
+				thread.no,
+				posts,
+				from,
+				posts[0],
+				!!posts[0].archived,
+				cycle,
+			);
+			if (ok) {
+				// The reply count of the thread JSON that was scanned, not the catalog's (the two can differ).
+				threads[key] = threadState(
+					posts.length - 1,
+					highestNo(posts, from),
+					replies,
+				);
+			} else {
+				notScanned();
 			}
 		}
 
-		// Threads that left the catalog while this browser was away (closed or asleep): look in the archive.
-		const missing = new Set(
-			Object.keys(oldThreads).filter((key) => !inCatalog.has(key)),
-		);
+		// Threads that left the catalog and may have unscanned posts: look them up in the archive. That is every one
+		// of them if the browser was away, else the ones still pending or with fewer replies scanned than the catalog
+		// last showed.
+		const wanted = new Map<string, number>();
+		for (const key of Object.keys(oldThreads)) {
+			if (!inCatalog.has(key) && needsArchiveScan(oldThreads[key], cycle.away))
+				wanted.set(key, oldThreads[key].lastScannedNo || 0);
+		}
 		const archiveURL = g.SITE.urls.archiveListJSON?.({ siteID, boardID });
-		if (
-			prev &&
-			missing.size > 0 &&
-			now - (prev.lastCycle || 0) > AWAY_GAP &&
-			archiveURL
-		) {
-			const archiveReq = await YouScanner.request(archiveURL, false);
+		if (prev && wanted.size > 0 && archiveURL) {
+			const archiveReq = await YouScanner.request(archiveURL, false, cycle);
+			YouScanner.alive(cycle);
 			const archive: number[] =
 				archiveReq?.status === 200 && Array.isArray(archiveReq.response)
 					? archiveReq.response
@@ -318,9 +431,10 @@ const YouScanner = {
 			for (const threadNo of archive) {
 				const key = `${threadNo}`;
 				let from: number;
-				if (missing.has(key)) {
-					from = oldThreads[key].lastScannedNo || 0;
+				if (wanted.has(key)) {
+					from = wanted.get(key) || 0;
 				} else if (
+					cycle.away &&
 					threadNo > (prev.maxThreadNoSeen || 0) &&
 					!(key in oldThreads) &&
 					!inCatalog.has(key)
@@ -333,7 +447,11 @@ const YouScanner = {
 				if (ThreadWatcher.isWatchedRaw(boardID, threadNo)) continue;
 				if (archiveFetches >= MAX_ARCHIVE_FETCHES) break;
 				archiveFetches++;
-				const posts = await YouScanner.fetchThreadPosts(boardID, threadNo);
+				const posts = await YouScanner.fetchThreadPosts(
+					boardID,
+					threadNo,
+					cycle,
+				);
 				if (posts)
 					await YouScanner.scanPosts(
 						boardID,
@@ -342,6 +460,7 @@ const YouScanner = {
 						from,
 						posts[0],
 						true,
+						cycle,
 					);
 			}
 		}
@@ -352,10 +471,14 @@ const YouScanner = {
 			maxThreadNoSeen,
 			threads,
 		}));
+		YouScanner.alive(cycle);
 		if (!leftover) YouScanner.pending.delete(boardID);
 	},
 
-	/** Scans posts newer than `from`; if any of them quotes one of your posts, adds the thread to the watcher. */
+	/**
+	 * Scans posts newer than `from`; if any of them quotes one of your posts, adds the thread to the watcher.
+	 * False when the thread should be scanned again (adding it failed).
+	 */
 	async scanPosts(
 		boardID: string,
 		threadNo: number,
@@ -363,7 +486,8 @@ const YouScanner = {
 		from: number,
 		op: ApiPost,
 		archived: boolean,
-	) {
+		cycle: Cycle,
+	): Promise<boolean> {
 		const siteID = g.SITE.ID;
 		let quotingNo = 0;
 		for (const post of posts) {
@@ -374,34 +498,74 @@ const YouScanner = {
 			);
 			if (quotesYou) quotingNo = post.no;
 		}
-		if (quotingNo)
-			await YouScanner.addToWatcher(boardID, threadNo, quotingNo, op, archived);
+		if (!quotingNo) return true;
+		return YouScanner.addToWatcher(
+			boardID,
+			threadNo,
+			quotingNo,
+			op,
+			archived,
+			cycle,
+		);
 	},
 
+	/**
+	 * Adds the thread to the watcher, then remembers the quoting post as handled (`youScannerAdded`), so a thread you
+	 * removed from the watcher only comes back for a newer quote. False when adding failed.
+	 */
 	async addToWatcher(
 		boardID: string,
 		threadNo: number,
 		quotingNo: number,
 		op: ApiPost,
 		archived: boolean,
-	) {
-		// Remember the highest quoting post handled per thread, so a thread you removed from the watcher only
-		// comes back for a new quote.
+		cycle: Cycle,
+	): Promise<boolean> {
 		const key = `${boardID}/${threadNo}`;
-		const added: Record<string, number> = await YouScanner.getStored(
+		const handled: Record<string, number> = await YouScanner.getStored(
 			"youScannerAdded",
 			dict(),
 		);
-		if (quotingNo <= (added[key] || 0)) return;
-		added[key] = quotingNo;
-		await YouScanner.setStored("youScannerAdded", added);
-		if (ThreadWatcher.isWatchedRaw(boardID, threadNo)) return;
-		const data: { excerpt: string; isDead?: boolean } = {
-			excerpt: YouScanner.excerpt(boardID, op),
-		};
-		if (archived) data.isDead = true;
-		// Same path as the watch button; it also starts the watcher's status fetch for the thread.
-		ThreadWatcher.addRaw(boardID, threadNo, data);
+		YouScanner.alive(cycle);
+		if (quotingNo <= (handled[key] || 0)) return true;
+		if (!ThreadWatcher.isWatchedRaw(boardID, threadNo)) {
+			const data: { excerpt: string; isDead?: boolean } = {
+				excerpt: YouScanner.excerpt(boardID, op),
+			};
+			if (archived) data.isDead = true;
+			let done: boolean | null = null;
+			try {
+				// Same path as the watch button. It starts the watcher's own threads.json and thread JSON requests,
+				// so it takes ADD_SLOTS queue slots.
+				done = await YouScanner.enqueue<boolean>(
+					cycle,
+					ADD_SLOTS,
+					(resolve) => {
+						if (!ThreadWatcher.isWatchedRaw(boardID, threadNo))
+							ThreadWatcher.addRaw(boardID, threadNo, data);
+						resolve(true);
+					},
+				);
+			} catch (err) {
+				if (err instanceof Error && err.message === CYCLE_STOPPED) throw err;
+				// Not marked as handled: the thread is tried again next cycle.
+				c.error(err);
+				return false;
+			}
+			YouScanner.alive(cycle);
+			if (!done) return false;
+		}
+		const latest: Record<string, number> = await YouScanner.getStored(
+			"youScannerAdded",
+			dict(),
+		);
+		YouScanner.alive(cycle);
+		if (quotingNo > (latest[key] || 0)) {
+			latest[key] = quotingNo;
+			await YouScanner.setStored("youScannerAdded", latest);
+			YouScanner.alive(cycle);
+		}
+		return true;
 	},
 
 	/** Same text as Get.threadExcerpt, built from API JSON instead of a parsed thread. */
@@ -420,77 +584,114 @@ const YouScanner = {
 	async fetchThreadPosts(
 		boardID: string,
 		threadNo: number,
+		cycle: Cycle,
 	): Promise<ApiPost[] | null> {
 		const url = g.SITE.urls.threadJSON({
 			siteID: g.SITE.ID,
 			boardID,
 			threadID: threadNo,
 		});
-		const req = await YouScanner.request(url, false);
+		const req = await YouScanner.request(url, false, cycle);
+		YouScanner.alive(cycle);
 		const posts = req?.status === 200 ? req.response?.posts : null;
 		return Array.isArray(posts) && posts.length > 0 ? posts : null;
 	},
 
 	/**
-	 * Queues a GET request. Request starts are at least REQUEST_GAP apart.
-	 * `ifModified` sends If-Modified-Since like the thread watcher does. Resolves with the finished request, or null.
+	 * Queues a GET request (one slot). `ifModified` sends If-Modified-Since like the thread watcher does.
+	 * Resolves with the finished request, or null.
 	 */
-	request(url: string, ifModified: boolean): Promise<XMLHttpRequest | null> {
-		return new Promise((resolve) => {
-			YouScanner.queue.push(() => {
+	async request(
+		url: string,
+		ifModified: boolean,
+		cycle: Cycle,
+	): Promise<XMLHttpRequest | null> {
+		try {
+			return await YouScanner.enqueue<XMLHttpRequest>(cycle, 1, (resolve) => {
 				const onloadend = function (this: XMLHttpRequest) {
 					resolve(this);
 				};
-				try {
-					if (ifModified) {
-						$.whenModified(url, "YouScanner", onloadend, { timeout: MINUTE });
-					} else {
-						$.ajax(url, { onloadend, timeout: MINUTE });
-					}
-				} catch (err) {
-					c.error(err);
-					resolve(null);
+				if (ifModified) {
+					$.whenModified(url, "YouScanner", onloadend, { timeout: MINUTE });
+				} else {
+					$.ajax(url, { onloadend, timeout: MINUTE });
 				}
+			});
+		} catch (err) {
+			if (err instanceof Error && err.message === CYCLE_STOPPED) throw err;
+			c.error(err);
+			return null;
+		}
+	},
+
+	/**
+	 * Queues a job. Job starts are at least REQUEST_GAP apart, and a job of N slots keeps the next start N gaps
+	 * away. Resolves with the job's value, rejects if the job throws, resolves null if the cycle stops first.
+	 */
+	enqueue<T>(
+		cycle: Cycle,
+		slots: number,
+		run: (resolve: (value: T) => void) => void,
+	): Promise<T | null> {
+		YouScanner.alive(cycle);
+		return new Promise<T | null>((resolve, reject) => {
+			YouScanner.queue.push({
+				cycle,
+				slots,
+				run: () => {
+					try {
+						run(resolve);
+					} catch (err) {
+						reject(err);
+					}
+				},
+				cancel: () => resolve(null),
 			});
 			if (!YouScanner.pumping) YouScanner.pump();
 		});
 	},
 
 	pump() {
-		const start = YouScanner.queue.shift();
-		if (!start) {
+		const job = YouScanner.queue.shift();
+		if (!job) {
 			YouScanner.pumping = false;
 			return;
 		}
 		YouScanner.pumping = true;
-		const wait = Math.max(
-			0,
-			YouScanner.lastRequestStart + REQUEST_GAP - Date.now(),
+		setTimeout(
+			() => {
+				if (job.cycle.gen !== YouScanner.cycleGen) {
+					job.cancel();
+				} else {
+					YouScanner.nextStartAt = Date.now() + job.slots * REQUEST_GAP;
+					// Heartbeat: other tabs see a recent last run and do not start a cycle of their own.
+					YouScanner.heartbeat();
+					job.run();
+				}
+				YouScanner.pump();
+			},
+			Math.max(0, YouScanner.nextStartAt - Date.now()),
 		);
-		setTimeout(() => {
-			YouScanner.lastRequestStart = Date.now();
-			// Heartbeat: other tabs see a recent last run and do not start a cycle of their own.
-			YouScanner.heartbeat();
-			start();
-			YouScanner.pump();
-		}, wait);
 	},
 
 	/**
 	 * Once per cycle, after scanning: drops the state of boards not scanned for STATE_MAX_AGE (they do a first run if
 	 * they come back), and keeps at most MAX_ADDED_ENTRIES entries in `youScannerAdded`.
 	 */
-	async prune(now: number) {
+	async prune(now: number, cycle: Cycle) {
 		const states = await YouScanner.loadState();
+		YouScanner.alive(cycle);
 		const stale = staleBoards(states, now);
 		if (stale.length > 0) {
 			for (const boardID of stale) delete states[boardID];
 			await YouScanner.setStored("youScannerState", states);
+			YouScanner.alive(cycle);
 		}
 		const added: Record<string, number> = await YouScanner.getStored(
 			"youScannerAdded",
 			dict(),
 		);
+		YouScanner.alive(cycle);
 		const drop = addedKeysToDrop(added, MAX_ADDED_ENTRIES);
 		if (drop.length > 0) {
 			for (const key of drop) delete added[key];
@@ -498,16 +699,32 @@ const YouScanner = {
 		}
 	},
 
-	getStored<T>(key: string, defaultValue: T): Promise<T> {
-		return new Promise((resolve) => {
-			$.get(key, defaultValue, (items) => resolve(items[key]));
+	/** A storage call that has not called back after STORAGE_TIMEOUT rejects. */
+	withTimeout<T>(promise: Promise<T>): Promise<T> {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const timeout = new Promise<never>((_resolve, reject) => {
+			timer = setTimeout(
+				() => reject(new Error(STORAGE_FAILED)),
+				STORAGE_TIMEOUT,
+			);
 		});
+		return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+	},
+
+	getStored<T>(key: string, defaultValue: T): Promise<T> {
+		return YouScanner.withTimeout(
+			new Promise<T>((resolve) => {
+				$.get(key, defaultValue, (items) => resolve(items[key]));
+			}),
+		);
 	},
 
 	setStored(key: string, value: unknown): Promise<void> {
-		return new Promise((resolve) => {
-			$.set(key, value, () => resolve());
-		});
+		return YouScanner.withTimeout(
+			new Promise<void>((resolve) => {
+				$.set(key, value, () => resolve());
+			}),
+		);
 	},
 
 	loadState(): Promise<Record<string, BoardScanState>> {

@@ -9,6 +9,7 @@ import { debounce, SECOND } from "../platform/helpers";
 import QuoteYou from "../Quotelinks/QuoteYou";
 import Favicon from "./Favicon";
 import ThreadWatcher from "./ThreadWatcher";
+import { findQuotedPosts } from "./YouScannerLogic";
 
 /*
  * decaffeinate suggestions:
@@ -170,13 +171,21 @@ var Unread = {
   },
 
   addPostQuotingYou(post) {
-    for (var quotelink of post.nodes.quotelinks) {
-      if (QuoteYou.db?.get(Get.postDataFromLink(quotelink))) {
-        Unread.postsQuotingYou.add((Unread.postsQuotingYou.last = post.ID));
-        Unread.openNotification(post);
-        return;
-      }
+    if (!Unread.quotesYou(post)) return;
+    Unread.postsQuotingYou.add((Unread.postsQuotingYou.last = post.ID));
+    Unread.openNotification(post);
+  },
+
+  // Same test as the thread watcher's check: the yourPosts lookup or the board + post number match on quote links,
+  // then the visible quote text in the comment, which also covers dead quotes.
+  quotesYou(post) {
+    for (const quotelink of post.nodes.quotelinks) {
+      const data = Get.postDataFromLink(quotelink);
+      if (QuoteYou.db?.get(data) || QuoteYou.isYouPostID(post.siteID, data.boardID, data.postID)) return true;
     }
+    if (QuoteYou.foreverIndex.size === 0) return false;
+    return findQuotedPosts(post.nodes.comment?.innerHTML, post.board.ID)
+      .some(quote => QuoteYou.isYouPostID(post.siteID, quote.boardID, quote.postID));
   },
 
   openNotification(post, predicate=' replied to you') {

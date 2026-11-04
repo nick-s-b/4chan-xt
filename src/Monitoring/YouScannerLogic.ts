@@ -40,15 +40,56 @@ export const RECENT_POSTS_WINDOW = 7 * 24 * 60 * 60 * 1000;
 export const MAX_THREAD_FETCHES = 30;
 /** Most thread JSON fetches per board per cycle for archived threads. */
 export const MAX_ARCHIVE_FETCHES = 100;
-/** If a board's previous cycle is older than this, threads that left the catalog are looked up in the archive. */
+/**
+ * If no tab scanned for longer than this (the stored last-run time at cycle start is older), the browser was away
+ * (closed or asleep), and that one cycle looks up threads that left the catalog in the archive.
+ */
 export const AWAY_GAP = 300 * 1000;
+/** A storage read or write that has not called back after this long counts as failed. */
+export const STORAGE_TIMEOUT = 10 * 1000;
+/** After a storage failure this tab stops scanning for this long, so other tabs can take over. */
+export const STORAGE_PAUSE = 10 * 60 * 1000;
+/** A cycle is stopped after this long, so the Web Lock is always released. */
+export const CYCLE_CAP = 15 * 60 * 1000;
+/** Queue slots (of REQUEST_GAP each) for adding a thread to the watcher: the add, threads.json, thread JSON. */
+export const ADD_SLOTS = 3;
 
 /** What the scanner remembers about one thread. */
 export interface ThreadScanState {
-	/** Reply count from the catalog at the last scan. */
+	/** Reply count of the source that was scanned: the thread JSON if it was fetched, else the catalog. */
 	replies: number;
 	/** Highest post number already scanned. */
 	lastScannedNo: number;
+	/** Reply count in the last catalog, stored only when it differs from `replies`. */
+	catalogReplies?: number;
+	/** Seen in the catalog but not scanned yet (over the fetch cap, a failed fetch or a failed add). */
+	pending?: boolean;
+}
+
+/** Builds a thread state, leaving out `catalogReplies` when equal to `replies` and `pending` when false. */
+export function threadState(
+	replies: number,
+	lastScannedNo: number,
+	catalogReplies: number,
+	pending = false,
+): ThreadScanState {
+	const state: ThreadScanState = { replies, lastScannedNo };
+	if (catalogReplies !== replies) state.catalogReplies = catalogReplies;
+	if (pending) state.pending = true;
+	return state;
+}
+
+/**
+ * True when a thread that left the catalog must be looked up in the archive: the browser was away, or the thread was
+ * never fully scanned (`pending`), or the last catalog showed more replies than were scanned.
+ */
+export function needsArchiveScan(
+	state: ThreadScanState | undefined,
+	away: boolean,
+): boolean {
+	if (!state) return false;
+	if (away || state.pending) return true;
+	return state.catalogReplies != null && state.replies < state.catalogReplies;
 }
 
 /** The fields of a catalog.json thread the scanner reads. */
