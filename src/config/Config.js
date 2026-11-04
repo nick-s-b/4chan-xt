@@ -476,6 +476,16 @@ const Config = {
         'The thread watcher will be visible when the page is loaded.',
         1
       ],
+      'Find replies to you in other threads': [
+        true,
+        'Scan boards in the background and add threads that quote your posts to the thread watcher.',
+        1
+      ],
+      'Reply scan boards': [
+        '',
+        'Boards to scan, separated by spaces. Empty = boards you posted on in the last 7 days.',
+        2
+      ],
       'Mark New IPs': [
         false,
         'Label each post from a new IP with the thread\'s current IP count.'
