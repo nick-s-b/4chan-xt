@@ -168,3 +168,17 @@ export function addedKeysToDrop(
 	);
 	return ranked.slice(max).map((entry) => entry.key);
 }
+
+/** The scanning tab writes `youScannerLastRun` at most this often (heartbeat). */
+export const HEARTBEAT_GAP = 10 * 1000;
+/** Without Web Locks, a tab waits a random time up to this long before starting a cycle, then checks again. */
+export const START_JITTER = 10 * 1000;
+
+/** True when a new cycle may start: the last run is at least CYCLE_INTERVAL old, or in the future (clock changed). */
+export function cycleDue(
+	lastRun: number | undefined | null,
+	now: number,
+): boolean {
+	const elapsed = now - (lastRun || 0);
+	return elapsed >= CYCLE_INTERVAL || elapsed < 0;
+}

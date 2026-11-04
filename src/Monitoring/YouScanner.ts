@@ -7,13 +7,16 @@ import {
 	AWAY_GAP,
 	addedKeysToDrop,
 	CYCLE_INTERVAL,
+	cycleDue,
 	findQuotedPosts,
+	HEARTBEAT_GAP,
 	MAX_ADDED_ENTRIES,
 	MAX_ARCHIVE_FETCHES,
 	MAX_THREAD_FETCHES,
 	needsThreadFetch,
 	pickBoards,
 	REQUEST_GAP,
+	START_JITTER,
 	staleBoards,
 	type ThreadScanState,
 } from "./YouScannerLogic";
@@ -49,6 +52,8 @@ interface ApiCatalogThread extends ApiPost {
 }
 
 const ENABLED = "Find replies to you in other threads";
+/** Web Locks name. All 4chan board tabs share the boards.4chan.org origin, so one lock covers every tab. */
+const LOCK_NAME = "4chanXT-youScanner";
 const BOARDS = "Reply scan boards";
 
 /** Highest post number in `posts`, or `from` if that is higher. */
@@ -66,6 +71,8 @@ const YouScanner = {
 	queue: [] as (() => void)[],
 	pumping: false,
 	lastRequestStart: 0,
+	/** Last time this tab wrote `youScannerLastRun`. */
+	lastHeartbeat: 0,
 	/** Boards whose last pass in this tab left threads unscanned (fetch cap reached or a fetch failed). */
 	pending: new Set<string>(),
 
@@ -101,8 +108,8 @@ const YouScanner = {
 	},
 
 	/**
-	 * Runs a cycle if no tab sent a scanner request in the last CYCLE_INTERVAL. The running tab refreshes
-	 * `youScannerLastRun` at every request start, so other tabs wait while it is mid-cycle.
+	 * Checks whether a cycle is due: no tab wrote `youScannerLastRun` in the last CYCLE_INTERVAL. The scanning tab
+	 * refreshes that value while it works (see heartbeat), so other tabs wait while it is mid-cycle.
 	 */
 	tick() {
 		if (!YouScanner.isEnabled() || YouScanner.running) {
@@ -111,15 +118,77 @@ const YouScanner = {
 		}
 		$.get("youScannerLastRun", 0, ({ youScannerLastRun }) => {
 			const now = Date.now();
-			const elapsed = now - (youScannerLastRun || 0);
-			if (elapsed >= CYCLE_INTERVAL || elapsed < 0) {
-				$.set("youScannerLastRun", now);
+			if (cycleDue(youScannerLastRun, now)) {
 				YouScanner.schedule(CYCLE_INTERVAL);
-				YouScanner.runCycle();
+				YouScanner.startCycle();
 			} else {
-				YouScanner.schedule(CYCLE_INTERVAL - elapsed);
+				YouScanner.schedule(CYCLE_INTERVAL - (now - youScannerLastRun));
 			}
 		});
+	},
+
+	/**
+	 * Only one tab may scan at a time. Main guard: a Web Lock shared by all tabs of the origin; a tab that cannot get
+	 * it skips this cycle. Fallback when Web Locks are missing or blocked: wait a random 0 to START_JITTER ms, so tabs
+	 * that checked at the same moment do not start together, then check again.
+	 */
+	startCycle() {
+		YouScanner.running = true;
+		let called = false;
+		try {
+			const locks = navigator.locks;
+			if (!locks?.request) throw new Error("Web Locks not available");
+			locks
+				.request(LOCK_NAME, { ifAvailable: true }, async (lock) => {
+					called = true;
+					if (!lock) {
+						// Another tab is scanning.
+						YouScanner.running = false;
+						return;
+					}
+					await YouScanner.runIfDue();
+				})
+				.catch((err) => {
+					if (called) {
+						c.error(err);
+					} else {
+						YouScanner.startAfterDelay();
+					}
+				});
+		} catch {
+			YouScanner.startAfterDelay();
+		}
+	},
+
+	startAfterDelay() {
+		setTimeout(YouScanner.runIfDue, Math.random() * START_JITTER);
+	},
+
+	/** Reads `youScannerLastRun` again (inside the lock, or after the random delay) and runs the cycle if still due. */
+	async runIfDue() {
+		try {
+			const lastRun: number = await YouScanner.getStored(
+				"youScannerLastRun",
+				0,
+			);
+			const now = Date.now();
+			if (!cycleDue(lastRun, now)) {
+				YouScanner.schedule(CYCLE_INTERVAL - (now - lastRun));
+				return;
+			}
+			YouScanner.heartbeat(true);
+			await YouScanner.runCycle();
+		} finally {
+			YouScanner.running = false;
+		}
+	},
+
+	/** Writes `youScannerLastRun`: always when a cycle starts (`force`), otherwise at most every HEARTBEAT_GAP. */
+	heartbeat(force = false) {
+		const now = Date.now();
+		if (!force && now - YouScanner.lastHeartbeat < HEARTBEAT_GAP) return;
+		YouScanner.lastHeartbeat = now;
+		$.set("youScannerLastRun", now);
 	},
 
 	async runCycle() {
@@ -401,7 +470,7 @@ const YouScanner = {
 		setTimeout(() => {
 			YouScanner.lastRequestStart = Date.now();
 			// Heartbeat: other tabs see a recent last run and do not start a cycle of their own.
-			$.set("youScannerLastRun", YouScanner.lastRequestStart);
+			YouScanner.heartbeat();
 			start();
 			YouScanner.pump();
 		}, wait);
