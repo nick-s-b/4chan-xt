@@ -5,13 +5,16 @@ import QuoteYou from "../Quotelinks/QuoteYou";
 import ThreadWatcher from "./ThreadWatcher";
 import {
 	AWAY_GAP,
+	addedKeysToDrop,
 	CYCLE_INTERVAL,
 	findQuotedPosts,
+	MAX_ADDED_ENTRIES,
 	MAX_ARCHIVE_FETCHES,
 	MAX_THREAD_FETCHES,
 	needsThreadFetch,
 	pickBoards,
 	REQUEST_GAP,
+	staleBoards,
 	type ThreadScanState,
 } from "./YouScannerLogic";
 
@@ -97,7 +100,10 @@ const YouScanner = {
 		YouScanner.timeout = setTimeout(YouScanner.tick, delay);
 	},
 
-	/** Runs a cycle if no tab ran one in the last CYCLE_INTERVAL. Two tabs racing only repeat work. */
+	/**
+	 * Runs a cycle if no tab sent a scanner request in the last CYCLE_INTERVAL. The running tab refreshes
+	 * `youScannerLastRun` at every request start, so other tabs wait while it is mid-cycle.
+	 */
 	tick() {
 		if (!YouScanner.isEnabled() || YouScanner.running) {
 			YouScanner.schedule(CYCLE_INTERVAL);
@@ -125,6 +131,7 @@ const YouScanner = {
 				if (!YouScanner.isEnabled()) break;
 				await YouScanner.scanBoard(boardID);
 			}
+			await YouScanner.prune(Date.now());
 		} catch (err) {
 			c.error(err);
 		} finally {
@@ -393,9 +400,33 @@ const YouScanner = {
 		);
 		setTimeout(() => {
 			YouScanner.lastRequestStart = Date.now();
+			// Heartbeat: other tabs see a recent last run and do not start a cycle of their own.
+			$.set("youScannerLastRun", YouScanner.lastRequestStart);
 			start();
 			YouScanner.pump();
 		}, wait);
+	},
+
+	/**
+	 * Once per cycle, after scanning: drops the state of boards not scanned for STATE_MAX_AGE (they do a first run if
+	 * they come back), and keeps at most MAX_ADDED_ENTRIES entries in `youScannerAdded`.
+	 */
+	async prune(now: number) {
+		const states = await YouScanner.loadState();
+		const stale = staleBoards(states, now);
+		if (stale.length > 0) {
+			for (const boardID of stale) delete states[boardID];
+			await YouScanner.setStored("youScannerState", states);
+		}
+		const added: Record<string, number> = await YouScanner.getStored(
+			"youScannerAdded",
+			dict(),
+		);
+		const drop = addedKeysToDrop(added, MAX_ADDED_ENTRIES);
+		if (drop.length > 0) {
+			for (const key of drop) delete added[key];
+			await YouScanner.setStored("youScannerAdded", added);
+		}
 	},
 
 	getStored<T>(key: string, defaultValue: T): Promise<T> {

@@ -114,3 +114,57 @@ export function pickBoards(
 	recent.sort((a, b) => b.latest - a.latest);
 	return recent.slice(0, MAX_BOARDS).map((board) => board.boardID);
 }
+
+/** A board's stored scan state is dropped when the board was not scanned for this long (it then does a first run). */
+export const STATE_MAX_AGE = 7 * 24 * 60 * 60 * 1000;
+/** Most entries kept in `youScannerAdded`. */
+export const MAX_ADDED_ENTRIES = 1000;
+
+/** Boards whose stored state was last scanned before `now - STATE_MAX_AGE`. */
+export function staleBoards(
+	states: Record<string, { lastCycle?: number }> | undefined | null,
+	now: number,
+): string[] {
+	const stale: string[] = [];
+	for (const boardID in states || {}) {
+		if ((states?.[boardID]?.lastCycle || 0) < now - STATE_MAX_AGE)
+			stale.push(boardID);
+	}
+	return stale;
+}
+
+/**
+ * Keys of `youScannerAdded` ("board/threadNo") to drop so that at most `max` remain.
+ * Thread numbers only compare within a board, so each board's entries are ranked newest thread first, and entries are
+ * kept by that rank: every board's newest, then every board's second newest, and so on. The oldest threads of the
+ * boards with the most entries are dropped first.
+ */
+export function addedKeysToDrop(
+	added: Record<string, unknown> | undefined | null,
+	max: number = MAX_ADDED_ENTRIES,
+): string[] {
+	const keys = Object.keys(added || {});
+	if (keys.length <= max) return [];
+	const byBoard = new Map<string, { key: string; threadNo: number }[]>();
+	for (const key of keys) {
+		const slash = key.lastIndexOf("/");
+		const boardID = slash >= 0 ? key.slice(0, slash) : "";
+		const threadNo = Number(key.slice(slash + 1));
+		const list = byBoard.get(boardID) || [];
+		list.push({ key, threadNo: Number.isFinite(threadNo) ? threadNo : 0 });
+		byBoard.set(boardID, list);
+	}
+	const ranked: { key: string; rank: number; boardID: string }[] = [];
+	for (const [boardID, list] of byBoard) {
+		list.sort((a, b) => b.threadNo - a.threadNo);
+		list.forEach((entry, rank) => {
+			ranked.push({ key: entry.key, rank, boardID });
+		});
+	}
+	ranked.sort(
+		(a, b) =>
+			a.rank - b.rank ||
+			(a.boardID < b.boardID ? -1 : a.boardID > b.boardID ? 1 : 0),
+	);
+	return ranked.slice(max).map((entry) => entry.key);
+}
