@@ -153,16 +153,34 @@ var QuoteYou = {
       ScrollMarkers.markScroll();
     }
 
+    // Dead quotes that were not turned into quote links (no thread number known).
+    const deadlinks = QuoteYou.foreverIndex.size > 0
+      ? $$('.deadlink', this.nodes.comment).filter(link => !this.nodes.quotelinks.includes(link))
+      : [];
+
     // Stop there if there's no quotes in that post.
-    if (!this.quotes.length) { return; }
+    if (!this.quotes.length && !deadlinks.length) { return; }
 
     for (var quotelink of this.nodes.quotelinks) {
-      if (QuoteYou.db.get(Get.postDataFromLink(quotelink))) {
-        if (Conf['Mark Quotes of You']) { $.add(quotelink, QuoteYou.mark.cloneNode(true)); }
-        $.addClass(quotelink, 'you');
-        $.addClass(this.nodes.root, 'quotesYou');
+      const data = Get.postDataFromLink(quotelink);
+      // The board + post number check also covers resurrected dead quotes, which have thread number 0.
+      if (QuoteYou.db.get(data) || QuoteYou.isYouPostID(this.siteID, data.boardID, data.postID)) {
+        QuoteYou.markQuote(this, quotelink);
       }
     }
+
+    for (const deadlink of deadlinks) {
+      const match = deadlink.textContent.match(/^>>(?:>\/([a-z\d]+)\/)?(\d+)/);
+      if (match && QuoteYou.isYouPostID(this.siteID, match[1] || this.board.ID, match[2])) {
+        QuoteYou.markQuote(this, deadlink);
+      }
+    }
+  },
+
+  markQuote(post, link) {
+    if (Conf['Mark Quotes of You']) { $.add(link, QuoteYou.mark.cloneNode(true)); }
+    $.addClass(link, 'you');
+    $.addClass(post.nodes.root, 'quotesYou');
   },
 
   menu: {
