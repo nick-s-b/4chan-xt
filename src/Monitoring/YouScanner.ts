@@ -1,3 +1,4 @@
+import Notice from "../classes/Notice";
 import { Conf, c, d, g } from "../globals/globals";
 import $ from "../platform/$";
 import { dict, MINUTE } from "../platform/helpers";
@@ -547,19 +548,25 @@ const YouScanner = {
 	): Promise<boolean> {
 		const siteID = g.SITE.ID;
 		let quotingNo = 0;
+		// Your post that the highest quoting post quotes.
+		let quotedNo = 0;
 		for (const post of posts) {
 			if (!(post.no > from) || post.no <= quotingNo) continue;
 			if (QuoteYou.isYouPostID(siteID, boardID, post.no)) continue;
-			const quotesYou = findQuotedPosts(post.com, boardID).some((quote) =>
-				QuoteYou.isYouPostID(siteID, quote.boardID, quote.postID),
+			const quote = findQuotedPosts(post.com, boardID).find((q) =>
+				QuoteYou.isYouPostID(siteID, q.boardID, q.postID),
 			);
-			if (quotesYou) quotingNo = post.no;
+			if (quote) {
+				quotingNo = post.no;
+				quotedNo = quote.postID;
+			}
 		}
 		if (!quotingNo) return true;
 		return YouScanner.addToWatcher(
 			boardID,
 			threadNo,
 			quotingNo,
+			quotedNo,
 			op,
 			archived,
 			cycle,
@@ -574,6 +581,7 @@ const YouScanner = {
 		boardID: string,
 		threadNo: number,
 		quotingNo: number,
+		quotedNo: number,
 		op: ApiPost,
 		archived: boolean,
 		cycle: Cycle,
@@ -585,9 +593,16 @@ const YouScanner = {
 		);
 		YouScanner.alive(cycle);
 		if (quotingNo <= (handled[key] || 0)) return true;
+		let addedNow = false;
 		if (!ThreadWatcher.isWatchedRaw(boardID, threadNo)) {
-			const data: { excerpt: string; isDead?: boolean } = {
+			// youScannerQuote: your quoted post, shown in the watcher entry's tooltip.
+			const data: {
+				excerpt: string;
+				youScannerQuote: number;
+				isDead?: boolean;
+			} = {
 				excerpt: YouScanner.excerpt(boardID, op),
+				youScannerQuote: quotedNo,
 			};
 			if (archived) data.isDead = true;
 			let done: boolean | null = null;
@@ -598,8 +613,10 @@ const YouScanner = {
 					cycle,
 					ADD_SLOTS,
 					(resolve) => {
-						if (!ThreadWatcher.isWatchedRaw(boardID, threadNo))
+						if (!ThreadWatcher.isWatchedRaw(boardID, threadNo)) {
 							ThreadWatcher.addRaw(boardID, threadNo, data);
+							addedNow = true;
+						}
 						resolve(true);
 					},
 				);
@@ -622,7 +639,24 @@ const YouScanner = {
 			await YouScanner.setStored("youScannerAdded", latest);
 			YouScanner.alive(cycle);
 		}
+		if (addedNow) await YouScanner.showIntro(quotedNo, cycle);
 		return true;
+	},
+
+	/** The first time the scanner adds a thread in this browser, one notice explains why it appeared. */
+	async showIntro(quotedNo: number, cycle: Cycle) {
+		const shown: boolean = await YouScanner.getStored(
+			"youScannerIntroShown",
+			false,
+		);
+		YouScanner.alive(cycle);
+		if (shown) return;
+		await YouScanner.setStored("youScannerIntroShown", true);
+		new Notice(
+			"info",
+			`Found a reply to your post >>${quotedNo} in a thread you were not watching, and added it to the thread watcher. This is the "Find replies to you in other threads" option (Settings > Main > Monitoring).`,
+		);
+		YouScanner.alive(cycle);
 	},
 
 	/** Same text as Get.threadExcerpt, built from API JSON instead of a parsed thread. */

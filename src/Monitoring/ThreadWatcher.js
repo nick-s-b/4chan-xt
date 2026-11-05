@@ -622,7 +622,8 @@ var ThreadWatcher = {
 
     const link = $.el('a', {
       href: g.sites[siteID]?.urls.thread({siteID, boardID, threadID}, isArchived) || '',
-      title: excerpt,
+      // Threads added by the reply scanner say why.
+      title: data.youScannerQuote ? `Added because it quotes your post >>${data.youScannerQuote}` : excerpt,
       className: 'watcher-link'
     });
 
