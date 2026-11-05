@@ -223,3 +223,6 @@ export function cycleDue(
 	const elapsed = now - (lastRun || 0);
 	return elapsed >= CYCLE_INTERVAL || elapsed < 0;
 }
+
+/** A manual scan (thread watcher refresh) starts at most this often per tab. */
+export const MANUAL_SCAN_GAP = 30 * 1000;

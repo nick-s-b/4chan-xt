@@ -208,6 +208,8 @@ var QuoteYou = {
       if (this.checked) {
         QuoteYou.db.set(data);
         QuoteYou.rememberForever(data);
+        // Marked by hand: quotes of this post may already be behind the reply scanner's position on this board.
+        $.event('YourPostMarked', {boardID: data.boardID, threadID: data.threadID, postID: data.postID});
       } else {
         QuoteYou.db.delete(data);
         QuoteYou.forgetForever(data);

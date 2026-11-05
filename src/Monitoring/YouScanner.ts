@@ -12,6 +12,7 @@ import {
 	cycleDue,
 	findQuotedPosts,
 	HEARTBEAT_GAP,
+	MANUAL_SCAN_GAP,
 	MAX_ADDED_ENTRIES,
 	MAX_ARCHIVE_FETCHES,
 	MAX_THREAD_FETCHES,
@@ -103,6 +104,8 @@ const YouScanner = {
 	cycleGen: 0,
 	/** After a storage failure this tab does not scan before this time. */
 	pausedUntil: 0,
+	/** Last time a manual scan (thread watcher refresh) was accepted in this tab. */
+	lastManualScan: 0,
 	/** Boards whose last pass in this tab left threads unscanned (fetch cap reached or a fetch failed). */
 	pending: new Set<string>(),
 
@@ -120,6 +123,12 @@ const YouScanner = {
 		$.sync(BOARDS, (text) => {
 			Conf[BOARDS] = text;
 		});
+		// A post marked as yours by hand (post menu "You"): rescan its board from the start.
+		$.on(d, "YourPostMarked", (e: CustomEvent) => {
+			if (e.detail?.boardID) YouScanner.forgetBoard(e.detail.boardID);
+		});
+		// Thread watcher refresh (button or keybind): scan now.
+		$.on(d, "ThreadWatcherRefresh", YouScanner.scanNow);
 		$.one(d, "4chanXInitFinished", YouScanner.tick);
 	},
 
@@ -162,11 +171,29 @@ const YouScanner = {
 	},
 
 	/**
+	 * Manual scan, from the thread watcher's refresh: starts a cycle now even if the last one is under CYCLE_INTERVAL
+	 * old. At most once per MANUAL_SCAN_GAP per tab; not while this tab scans or is paused. It goes through the same
+	 * guard (Web Lock or fallback), queue and rules as a normal cycle.
+	 */
+	scanNow() {
+		const now = Date.now();
+		if (
+			!YouScanner.isEnabled() ||
+			YouScanner.running ||
+			now < YouScanner.pausedUntil ||
+			now - YouScanner.lastManualScan < MANUAL_SCAN_GAP
+		)
+			return;
+		YouScanner.lastManualScan = now;
+		YouScanner.startCycle(true);
+	},
+
+	/**
 	 * Only one tab may scan at a time. Main guard: a Web Lock shared by all tabs of the origin; a tab that cannot get
 	 * it skips this cycle. Fallback when Web Locks are missing or blocked: wait a random 0 to START_JITTER ms, so tabs
 	 * that checked at the same moment do not start together, then check again.
 	 */
-	startCycle() {
+	startCycle(manual = false) {
 		YouScanner.running = true;
 		let called = false;
 		try {
@@ -180,39 +207,53 @@ const YouScanner = {
 						YouScanner.running = false;
 						return;
 					}
-					await YouScanner.runIfDue();
+					await YouScanner.runIfDue(manual, true);
 				})
 				.catch((err) => {
 					if (called) {
 						c.error(err);
 					} else {
-						YouScanner.startAfterDelay();
+						YouScanner.startAfterDelay(manual);
 					}
 				});
 		} catch {
-			YouScanner.startAfterDelay();
+			YouScanner.startAfterDelay(manual);
 		}
 	},
 
-	startAfterDelay() {
-		setTimeout(YouScanner.runIfDue, Math.random() * START_JITTER);
+	startAfterDelay(manual: boolean) {
+		setTimeout(
+			() => YouScanner.runIfDue(manual, false),
+			Math.random() * START_JITTER,
+		);
 	},
 
 	/**
 	 * Reads `youScannerLastRun` again (inside the lock, or after the random delay) and runs the cycle if still due.
-	 * Always returns, so the lock is always released.
+	 * A manual scan skips the due check. Always returns, so the lock is always released.
 	 */
-	async runIfDue() {
+	async runIfDue(manual = false, locked = false) {
 		try {
 			const lastRun: number = await YouScanner.getStored(
 				"youScannerLastRun",
 				0,
 			);
 			const now = Date.now();
-			if (!cycleDue(lastRun, now)) {
+			if (!manual && !cycleDue(lastRun, now)) {
 				YouScanner.schedule(CYCLE_INTERVAL - (now - lastRun));
 				return;
 			}
+			// Without the lock, a manual scan must not overlap another tab's cycle. A scanning tab writes the last-run
+			// time at least every HEARTBEAT_GAP while it sends requests, so a recent value from another tab means it
+			// is still scanning.
+			if (
+				manual &&
+				!locked &&
+				lastRun !== YouScanner.lastHeartbeat &&
+				now - lastRun >= 0 &&
+				now - lastRun < HEARTBEAT_GAP + REQUEST_GAP
+			)
+				return;
 			// No tab scanned for longer than AWAY_GAP: the browser was closed or asleep.
 			const away = !!lastRun && now - lastRun > AWAY_GAP;
 			YouScanner.heartbeat(true);
@@ -292,8 +333,13 @@ const YouScanner = {
 	async scanBoard(boardID: string, cycle: Cycle) {
 		const siteID = g.SITE.ID;
 		const catalogURL = g.SITE.urls.catalogJSON({ siteID, boardID });
-		// Work left over from the previous pass: ask for the full catalog instead of a possible 304.
-		if (YouScanner.pending.has(boardID))
+		const prev: BoardScanState | undefined = (await YouScanner.loadState())[
+			boardID
+		];
+		YouScanner.alive(cycle);
+		// Work left over from the previous pass, or no state (first run, or a rescan after a post was marked as yours
+		// by hand): ask for the full catalog instead of a possible 304.
+		if (YouScanner.pending.has(boardID) || !prev)
 			delete $.lastModified.YouScanner?.[catalogURL];
 		const catalogReq = await YouScanner.request(catalogURL, true, cycle);
 		YouScanner.alive(cycle);
@@ -310,10 +356,6 @@ const YouScanner = {
 		if (!Array.isArray(pages)) return;
 
 		YouScanner.pending.add(boardID);
-		const prev: BoardScanState | undefined = (await YouScanner.loadState())[
-			boardID
-		];
-		YouScanner.alive(cycle);
 		const oldThreads = prev?.threads || {};
 		const threads: Record<string, ThreadScanState> = dict();
 		const inCatalog = new Set<string>();
@@ -465,14 +507,29 @@ const YouScanner = {
 			}
 		}
 
-		// Threads that left the catalog are not carried over into the new state.
-		await YouScanner.saveBoard(boardID, () => ({
-			lastCycle: now,
-			maxThreadNoSeen,
-			threads,
-		}));
+		// Threads that left the catalog are not carried over into the new state. If the board's state was deleted
+		// while this scan ran (a post was marked as yours by hand), keep it deleted so the next cycle starts over.
+		await YouScanner.saveBoard(boardID, (state) =>
+			prev && !state ? undefined : { lastCycle: now, maxThreadNoSeen, threads },
+		);
 		YouScanner.alive(cycle);
 		if (!leftover) YouScanner.pending.delete(boardID);
+	},
+
+	/**
+	 * A post on this board was marked as yours by hand. Quotes of it may already be behind the scan position, so the
+	 * board's state is dropped and its next cycle is a first run. `youScannerAdded` is kept, so threads you removed
+	 * from the watcher do not come back for old quotes.
+	 */
+	async forgetBoard(boardID: string) {
+		try {
+			const states = await YouScanner.loadState();
+			if (!(boardID in states)) return;
+			delete states[boardID];
+			await YouScanner.setStored("youScannerState", states);
+		} catch (err) {
+			c.error(err);
+		}
 	},
 
 	/**

@@ -381,7 +381,10 @@ var ThreadWatcher = {
     if (ThreadWatcher.syncing || ThreadWatcher.requests.length) {
       return ThreadWatcher.abort();
     } else {
-      return ThreadWatcher.fetchAllStatus();
+      const result = ThreadWatcher.fetchAllStatus();
+      // Manual refresh (button or keybind): the reply scanner also scans now.
+      $.event('ThreadWatcherRefresh');
+      return result;
     }
   },
 
