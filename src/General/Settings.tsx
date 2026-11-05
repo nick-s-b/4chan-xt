@@ -193,12 +193,21 @@ Enable it on boards.${location.hostname.split('.')[1]}.org in your browser's pri
         var arr = obj[key];
         if (arr instanceof Array) {
           var description = arr[1];
-          var div = $.el('div',
-            { innerHTML: `<label><input type="checkbox" name="${key}">${key}</label><span class="description">: ${description}</span>` });
+          // A string default makes a text field instead of a checkbox.
+          const isText = typeof arr[0] === 'string';
+          var div = $.el('div', {
+            innerHTML: isText
+              ? `<label>${key} <input type="text" class="field" name="${key}" spellcheck="false"></label><span class="description">: ${description}</span>`
+              : `<label><input type="checkbox" name="${key}">${key}</label><span class="description">: ${description}</span>`
+          });
           div.dataset.name = key;
           var input = $('input', div);
-          $.on(input, 'change', $.cb.checked);
-          $.on(input, 'change', function() { this.parentNode.parentNode.dataset.checked = this.checked; });
+          if (isText) {
+            $.on(input, 'change', $.cb.value);
+          } else {
+            $.on(input, 'change', $.cb.checked);
+            $.on(input, 'change', function() { this.parentNode.parentNode.dataset.checked = this.checked; });
+          }
           items[key] = Conf[key];
           inputs[key] = input;
           var level = arr[2] || 0;
@@ -232,6 +241,10 @@ Enable it on boards.${location.hostname.split('.')[1]}.org in your browser's pri
     $.get(items, function(items) {
       for (key in items) {
         var val = items[key];
+        if (inputs[key].type === 'text') {
+          inputs[key].value = val;
+          continue;
+        }
         inputs[key].checked = val;
         inputs[key].parentNode.parentNode.dataset.checked = val;
       }
@@ -349,6 +362,7 @@ Enable it on boards.${location.hostname.split('.')[1]}.org in your browser's pri
       delete Conf2.hiddenPosterIds;
       delete Conf2.lastReadPosts;
       delete Conf2.yourPosts;
+      delete Conf2.yourPostsForever;
       delete Conf2.watchedThreads;
       delete Conf2.cooldowns;
       delete Conf2['Index Sort'];

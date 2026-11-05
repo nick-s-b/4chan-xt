@@ -38,6 +38,7 @@ export default class DataBoard {
     'hiddenPosterIds',
     'lastReadPosts',
     'yourPosts',
+    'yourPostsForever',
     'watchedThreads',
     'watcherLastModified',
     'customTitles',
@@ -190,8 +191,10 @@ export default class DataBoard {
       let thread;
       if (threadID == null) {
         if (postID != null) {
-          for (thread = 0; thread < board.length; thread++) {
-            if (postID in thread) {
+          // No thread given: look for the post in every thread of the board.
+          for (const tid in board) {
+            thread = board[tid];
+            if (thread && (typeof thread === 'object') && (postID in thread)) {
               val = thread[postID];
               break;
             }
